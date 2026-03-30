@@ -1,0 +1,150 @@
+name: Manual Chain Trigger
+
+on:
+  # Instant restart: fires the moment rdp-session.yml completes/fails/cancels
+  workflow_run:
+    workflows: ["Infinite RDP Session"]
+    types:
+      - completed
+
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: 'Existing session ID to continue (leave empty for new)'
+        required: false
+        default: ''
+      stop_session:
+        description: 'Stop the session chain'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop Session
+        if: ${{ github.event.inputs.stop_session == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          echo "Stopping session chain..."
+
+          # Cancel all running RDP sessions
+          ACTIVE_RUNS=$(gh run list \
+            --repo "$REPO" \
+            --workflow "rdp-session.yml" \
+            --status in_progress \
+            --json databaseId \
+            --jq '.[].databaseId')
+
+          for RUN_ID in $ACTIVE_RUNS; do
+            echo "Cancelling run: $RUN_ID"
+            gh run cancel "$RUN_ID" --repo "$REPO" || true
+          done
+
+          # Set a repo variable to signal the watcher to stay off
+          gh variable set RDP_ENABLED --body "false" --repo "$REPO"
+
+          echo ""
+          echo "✅ Session chain stopped"
+          echo "   RDP_ENABLED set to false — watcher will not restart sessions"
+          echo "   To resume: run this workflow with stop_session=false"
+
+      - name: Check and Trigger RDP Session
+        if: ${{ github.event.inputs.stop_session != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          REPO="${{ github.repository }}"
+          IS_WATCHER="${{ github.event_name == 'workflow_run' }}"
+
+          # For workflow_run triggers, check if RDP is enabled
+          if [ "$IS_WATCHER" = "true" ]; then
+            RDP_ENABLED=$(gh variable get RDP_ENABLED --repo "$REPO" 2>/dev/null || echo "true")
+
+            if [ "$RDP_ENABLED" = "false" ]; then
+              echo "⏸️  RDP_ENABLED=false — watcher is paused, skipping"
+              exit 0
+            fi
+
+            # Log what happened to the previous session
+            echo "Previous session ended:"
+            echo "  Run ID:     ${{ github.event.workflow_run.id }}"
+            echo "  Conclusion: ${{ github.event.workflow_run.conclusion }}"
+            echo "  Status:     ${{ github.event.workflow_run.status }}"
+          fi
+
+          # Check for active/queued RDP sessions
+          ACTIVE_RUNS=$(gh run list \
+            --repo "$REPO" \
+            --workflow "rdp-session.yml" \
+            --status in_progress \
+            --json databaseId \
+            --jq 'length')
+
+          QUEUED_RUNS=$(gh run list \
+            --repo "$REPO" \
+            --workflow "rdp-session.yml" \
+            --status queued \
+            --json databaseId \
+            --jq 'length')
+
+          TOTAL=$((ACTIVE_RUNS + QUEUED_RUNS))
+
+          echo "Active: $ACTIVE_RUNS | Queued: $QUEUED_RUNS | Total: $TOTAL"
+
+          if [ "$TOTAL" -gt 0 ] && [ "$IS_WATCHER" = "true" ]; then
+            echo "✅ RDP session is already running — no action needed"
+            echo "   (rdp-session.yml likely chained itself successfully)"
+            exit 0
+          fi
+
+          # If manual trigger or no active sessions, start one
+          if [ "$IS_WATCHER" = "true" ]; then
+            echo ""
+            echo "⚠️  No active RDP session found after previous run ended!"
+            echo "   Both chain layers failed — watcher is restarting..."
+          fi
+
+          # Enable RDP on manual trigger
+          if [ "$IS_WATCHER" != "true" ]; then
+            gh variable set RDP_ENABLED --body "true" --repo "$REPO"
+          fi
+
+          SESSION_ID="${{ github.event.inputs.session_id }}"
+          if [ -z "$SESSION_ID" ]; then
+            SESSION_ID=$(openssl rand -hex 4)
+          fi
+
+          echo "Triggering RDP session: $SESSION_ID"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/dispatches" \
+            -d "{\"event_type\":\"chain-rdp\",\"client_payload\":{\"session_id\":\"$SESSION_ID\",\"chain_count\":0}}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "HTTP Status: $HTTP_CODE"
+          if [ -n "$BODY" ]; then
+            echo "Response: $BODY"
+          fi
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo ""
+            echo "✅ Session triggered successfully!"
+            echo "Session ID: $SESSION_ID"
+            echo "Source: $([ "$IS_WATCHER" = "true" ] && echo "watcher (auto)" || echo "manual")"
+          else
+            echo ""
+            echo "❌ Failed to trigger session"
+            echo "Make sure:"
+            echo "  1. GH_PAT secret has 'repo' scope"
+            echo "  2. rdp-session.yml has no syntax errors"
+            exit 1
+          fi
